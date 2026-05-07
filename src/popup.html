@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Auto-Viewer</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Auto-Viewer</h1>
+
+      <label class="toggle">
+        <input type="checkbox" id="enabled" />
+        <span>Enabled</span>
+      </label>
+
+      <button id="run" type="button">Run on this page</button>
+      <p id="status" class="status"></p>
+
+      <a id="open-options" class="link" target="_blank" rel="noopener">Edit patterns…</a>
+    </div>
+    <script src="storage.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

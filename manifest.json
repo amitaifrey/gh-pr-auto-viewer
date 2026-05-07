@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "GitHub Generated-File Auto-Viewer",
+  "version": "0.1.0",
+  "description": "Automatically marks generated files as Viewed on GitHub PRs based on user-defined glob patterns.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": ["https://github.com/*"],
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "GitHub Generated-File Auto-Viewer"
+  },
+  "options_ui": {
+    "page": "src/options.html",
+    "open_in_tab": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://github.com/*/*/pull/*/files*",
+        "https://github.com/*/*/pull/*/changes*"
+      ],
+      "js": ["src/page-interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://github.com/*/*/pull/*/files*",
+        "https://github.com/*/*/pull/*/changes*"
+      ],
+      "js": ["src/glob.js", "src/storage.js", "src/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/16.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  }
+}

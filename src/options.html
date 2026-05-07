@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Auto-Viewer Settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>GitHub Generated-File Auto-Viewer</h1>
+        <p class="sub">
+          Files whose paths match any of these glob patterns will be marked as
+          <strong>Viewed</strong> on the PR's Files tab.
+        </p>
+      </header>
+
+      <section>
+        <label for="patterns">Patterns (one per line)</label>
+        <textarea id="patterns" spellcheck="false" autocomplete="off"></textarea>
+        <p class="hint">
+          <code>**</code> = any depth · <code>*</code> = any chars except <code>/</code> ·
+          <code>?</code> = single char · <code>{a,b}</code> = alternation ·
+          <code>[abc]</code> = char class · <code>!</code> at line start = negate ·
+          <code>#</code> at line start = comment.
+        </p>
+      </section>
+
+      <section>
+        <label for="tester">Test a path</label>
+        <input id="tester" type="text" placeholder="e.g. src/proto/foo.pb.go" />
+        <p id="tester-result" class="result">—</p>
+      </section>
+
+      <footer>
+        <button id="save" type="button">Save</button>
+        <button id="reset" type="button" class="secondary">Reset to defaults</button>
+        <span id="status" class="status"></span>
+      </footer>
+    </main>
+    <script src="glob.js"></script>
+    <script src="storage.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>
