@@ -212,6 +212,33 @@
     queueTimer = setTimeout(drain, 0);
   }
 
+  // Dispatches a thorough mouse-click sequence so React/Primer button
+  // handlers fire reliably (a bare el.click() can sometimes be ignored).
+  function dispatchRealClick(btn) {
+    if (!btn || !btn.isConnected) return;
+    let x = 0, y = 0;
+    try {
+      const r = btn.getBoundingClientRect();
+      x = r.left + r.width / 2;
+      y = r.top + r.height / 2;
+    } catch (_) {}
+    const base = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      button: 0,
+      buttons: 1,
+      clientX: x,
+      clientY: y,
+    };
+    try { btn.focus(); } catch (_) {}
+    try { btn.dispatchEvent(new PointerEvent('pointerdown', { ...base, pointerType: 'mouse' })); } catch (_) {}
+    try { btn.dispatchEvent(new MouseEvent('mousedown', base)); } catch (_) {}
+    try { btn.dispatchEvent(new PointerEvent('pointerup', { ...base, pointerType: 'mouse' })); } catch (_) {}
+    try { btn.dispatchEvent(new MouseEvent('mouseup', base)); } catch (_) {}
+    try { btn.click(); } catch (_) {}
+  }
+
   async function processFile(fileEl, { force = false } = {}) {
     if (!force && fileEl.getAttribute(HANDLED_ATTR) === '1') return;
     const path = getFilePath(fileEl);
@@ -220,24 +247,33 @@
     if (!window.GReadGlob.matchAny(path, settings.patterns)) return;
     const toggle = getViewedToggle(fileEl);
 
-    // Legacy /files: clicking the native checkbox toggles state and POSTs for us.
+    // Legacy /files: clicking the native checkbox toggles state + POSTs.
     if (toggle && toggle.kind === 'checkbox') {
       if (!toggle.isViewed()) enqueueClick(toggle.el);
       return;
     }
 
-    // New /changes: prefer the API directly so virtualized rows can be marked too.
-    if (toggle && toggle.kind === 'button' && toggle.isViewed()) return;
+    // New /changes: try clicking the React button first. When that works,
+    // React updates its own state (so the file visibly collapses) AND POSTs
+    // to /file_review itself — no double-POST, no refresh needed.
+    if (toggle && toggle.kind === 'button') {
+      if (toggle.isViewed()) return;
+      dispatchRealClick(toggle.el);
+      // Give React a beat to update aria-pressed.
+      await new Promise((r) => setTimeout(r, 300));
+      if (toggle.isViewed()) return;
+    }
+
+    // Fallback path: either the button isn't rendered (virtualized row) or
+    // the click didn't take effect. POST to the API and fake the visual.
     const result = await markViewedAPI(path);
     if (result.ok && toggle && toggle.kind === 'button') {
-      // Fake the visual state so the file collapses without waiting for re-render.
       try {
         toggle.el.setAttribute('aria-pressed', 'true');
         toggle.el.setAttribute('aria-label', 'Viewed');
       } catch (_) {}
     }
     if (!result.ok) {
-      // Don't keep retrying a failing path forever, but don't poison the entry either.
       fileEl.removeAttribute(HANDLED_ATTR);
     }
   }
@@ -246,41 +282,24 @@
     if (!isPullFilesPage()) return;
     const files = document.querySelectorAll(FILE_SELECTORS);
     files.forEach((el) => processFile(el, { force }));
-    if (files.length === 0) diagnose();
+  }
+
+  // Debounced full rescan — cheaper to scan all FILE_SELECTORS than to track
+  // individual mutations, and avoids races where the React diff list is
+  // added with all entries in one mutation batch we then mis-parse.
+  let rescanTimer = null;
+  function scheduleRescan() {
+    if (rescanTimer) return;
+    rescanTimer = setTimeout(() => {
+      rescanTimer = null;
+      scan();
+    }, 150);
   }
 
   function startObserver() {
     if (observer) observer.disconnect();
-    const root =
-      document.querySelector('[data-testid="progressive-diffs-list"]') ||
-      document.querySelector('#files') ||
-      document.querySelector('#diff-content') ||
-      document.body;
-    observer = new MutationObserver((mutations) => {
-      let needRescan = false;
-      for (const m of mutations) {
-        for (const node of m.addedNodes) {
-          if (!(node instanceof Element)) continue;
-          if (node.matches?.(FILE_SELECTORS)) {
-            processFile(node);
-            needRescan = true;
-          }
-          node.querySelectorAll?.(FILE_SELECTORS).forEach((el) => {
-            processFile(el);
-            needRescan = true;
-          });
-        }
-      }
-      if (!needRescan) {
-        // Children of a known file container may have mounted (path/button).
-        for (const m of mutations) {
-          const fileAncestor =
-            m.target instanceof Element ? m.target.closest(FILE_SELECTORS) : null;
-          if (fileAncestor) processFile(fileAncestor);
-        }
-      }
-    });
-    observer.observe(root, { childList: true, subtree: true });
+    observer = new MutationObserver(() => scheduleRescan());
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   function clearHandled() {
@@ -296,6 +315,14 @@
     if (force) clearHandled();
     scan({ force });
     startObserver();
+    // React may mount the diff list after document_idle. Retry a few times
+    // so we don't depend solely on the mutation observer catching it.
+    setTimeout(() => scan(), 500);
+    setTimeout(() => scan(), 1500);
+    setTimeout(() => scan(), 3000);
+    setTimeout(() => {
+      if (document.querySelectorAll(FILE_SELECTORS).length === 0) diagnose();
+    }, 4500);
   }
 
   // ---- diagnostics (only when no file containers are found) ----
