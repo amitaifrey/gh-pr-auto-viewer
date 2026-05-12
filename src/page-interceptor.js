@@ -1,40 +1,19 @@
-// Runs in the page's main world. Two jobs:
-//   1. Wrap window.fetch so we can capture headers GitHub's React client
-//      sends to /file_review (specifically X-Fetch-Nonce and
-//      X-GitHub-Client-Version) and forward them to the content script.
-//   2. Receive "mark-viewed" requests from the content script and execute
-//      them as same-origin fetches (Origin: https://github.com), then post
-//      the result back. This is necessary because content-script fetches
-//      have an extension Origin which GitHub's verified-fetch rejects.
+// Runs in the page's main world. Bridge for the content script:
+//   1. "click-toggle" — locate a diff entry by file path and invoke its
+//      MarkAsViewed button's onClick handler directly via __reactProps so
+//      React's own state + network request fire (file collapses without
+//      a refresh). Legacy /files checkboxes are handled too.
+//   2. "mark-viewed" — fall-through POST to /file_review using the page's
+//      same-origin context (so GitHub's verified-fetch accepts it). Used
+//      only when the click path can't reach a toggle.
+// No fetch wrapping — we used to wrap window.fetch to capture GitHub's
+// per-session X-Fetch-Nonce, but every unrelated page fetch failure got
+// blamed on our wrapper's stack frame. We now read the nonce from the
+// page's meta tags instead (see content.js#getFetchNonce).
 (function () {
   if (window.__greadextInterceptorInstalled) return;
   window.__greadextInterceptorInstalled = true;
 
-  const origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    try {
-      const url = typeof input === 'string' ? input : input && input.url;
-      const method =
-        (init && init.method) ||
-        (typeof input === 'object' && input && input.method) ||
-        'GET';
-      if (url && /\/file_review(\?|$)/.test(url) && /post/i.test(method)) {
-        const h = {};
-        const src = (init && init.headers) || (typeof input === 'object' && input && input.headers);
-        if (src && typeof src.forEach === 'function') {
-          src.forEach((v, k) => {
-            h[String(k).toLowerCase()] = v;
-          });
-        } else if (src && typeof src === 'object') {
-          for (const k of Object.keys(src)) h[k.toLowerCase()] = src[k];
-        }
-        window.postMessage({ __greadext: true, type: 'captured-headers', headers: h }, '*');
-      }
-    } catch (_) {}
-    return origFetch.apply(this, arguments);
-  };
-
-  // Strip Unicode bidi marks GitHub adds around link text.
   const stripBidi = (s) => (s || '').replace(/[‎‏‪‫‬‭‮]/g, '').trim();
 
   function findEntryByPath(path) {
@@ -77,18 +56,15 @@
   function clickToggleForPath(path) {
     const entry = findEntryByPath(path);
     if (!entry) return { found: false, reason: 'no-entry' };
-    // Legacy checkbox path
     const cb = entry.querySelector('input.js-reviewed-checkbox, input[name="viewed"]');
     if (cb) {
       if (cb.checked) return { found: true, alreadyViewed: true };
       try { cb.click(); } catch (_) {}
       return { found: true, kind: 'checkbox' };
     }
-    // New React button
     const btn = entry.querySelector('button[class*="MarkAsViewedButton-module"]');
     if (!btn) return { found: false, reason: 'no-toggle' };
-    const pressed = btn.getAttribute('aria-pressed');
-    if (pressed === 'true') return { found: true, alreadyViewed: true };
+    if (btn.getAttribute('aria-pressed') === 'true') return { found: true, alreadyViewed: true };
     const viaReact = callReactOnClick(btn);
     if (viaReact) return { found: true, kind: 'button-react' };
     try {
@@ -123,7 +99,7 @@
     if (d.type === 'mark-viewed') {
       const { id, url, headers, body } = d;
       try {
-        const resp = await origFetch(url, {
+        const resp = await fetch(url, {
           method: 'POST',
           credentials: 'include',
           headers,

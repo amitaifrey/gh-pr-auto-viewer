@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GitHub Generated-File Auto-Viewer",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Automatically marks generated files as Viewed on GitHub PRs based on user-defined glob patterns.",
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": ["https://github.com/*"],

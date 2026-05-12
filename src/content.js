@@ -3,7 +3,7 @@
 // "Viewed" control so GitHub collapses them. Supports both the legacy
 // /files DOM and the new React-based /changes experience.
 (function () {
-  console.log('[GReadExt] v0.1.3 loaded on', location.href);
+  console.log('[GReadExt] v0.1.4 loaded on', location.href);
   const HANDLED_ATTR = 'data-greadext-handled';
   const CLICK_INTERVAL_MS = 80;
   const LRM_RE = /[‎‏‪-‮]/g;
