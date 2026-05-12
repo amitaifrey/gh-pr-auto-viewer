@@ -3,7 +3,7 @@
 // "Viewed" control so GitHub collapses them. Supports both the legacy
 // /files DOM and the new React-based /changes experience.
 (function () {
-  console.log('[GReadExt] v0.1.2 loaded on', location.href);
+  console.log('[GReadExt] v0.1.3 loaded on', location.href);
   const HANDLED_ATTR = 'data-greadext-handled';
   const CLICK_INTERVAL_MS = 80;
   const LRM_RE = /[‎‏‪-‮]/g;
@@ -176,7 +176,7 @@
   }
 
   // The page-world interceptor (src/page-interceptor.js) posts captured
-  // headers from real /file_review requests AND fetch results back to us.
+  // headers, fetch results, and click results back to us.
   window.addEventListener('message', (e) => {
     if (e.source !== window) return;
     const d = e.data;
@@ -191,8 +191,28 @@
         pendingRequests.delete(d.id);
         resolve({ ok: !!d.ok, status: d.status, body: d.body, error: d.error });
       }
+      return;
+    }
+    if (d.type === 'click-toggle-result' && d.id) {
+      const resolve = pendingRequests.get(d.id);
+      if (resolve) {
+        pendingRequests.delete(d.id);
+        resolve(d);
+      }
     }
   });
+
+  async function clickToggleViaBridge(path) {
+    const id = nextRequestId++;
+    const promise = new Promise((resolve) => pendingRequests.set(id, resolve));
+    window.postMessage({ __greadext: true, type: 'click-toggle', id, path }, '*');
+    const timeout = new Promise((resolve) =>
+      setTimeout(() => resolve({ found: false, reason: 'timeout' }), 3000)
+    );
+    const result = await Promise.race([promise, timeout]);
+    pendingRequests.delete(id);
+    return result;
+  }
 
   function enqueueClick(el) {
     clickQueue.push(el);
@@ -241,41 +261,58 @@
   }
 
   async function processFile(fileEl, { force = false } = {}) {
-    if (!force && fileEl.getAttribute(HANDLED_ATTR) === '1') return;
+    const state = fileEl.getAttribute(HANDLED_ATTR);
+    if (!force && (state === 'viewed' || state === 'not-matched')) return;
+    if (fileEl.getAttribute('data-greadext-busy') === '1') return;
+
     const path = getFilePath(fileEl);
     if (!path) return; // try again later (children may not be mounted yet)
-    fileEl.setAttribute(HANDLED_ATTR, '1');
-    if (!window.GReadGlob.matchAny(path, settings.patterns)) return;
-    const toggle = getViewedToggle(fileEl);
 
-    // Legacy /files: clicking the native checkbox toggles state + POSTs.
-    if (toggle && toggle.kind === 'checkbox') {
-      if (!toggle.isViewed()) enqueueClick(toggle.el);
+    if (!window.GReadGlob.matchAny(path, settings.patterns)) {
+      fileEl.setAttribute(HANDLED_ATTR, 'not-matched');
       return;
     }
 
-    // New /changes: try clicking the React button first. When that works,
-    // React updates its own state (so the file visibly collapses) AND POSTs
-    // to /file_review itself — no double-POST, no refresh needed.
-    if (toggle && toggle.kind === 'button') {
-      if (toggle.isViewed()) return;
-      dispatchRealClick(toggle.el);
-      // Give React a beat to update aria-pressed.
-      await new Promise((r) => setTimeout(r, 300));
-      if (toggle.isViewed()) return;
+    const toggle = getViewedToggle(fileEl);
+    if (toggle && toggle.isViewed()) {
+      fileEl.setAttribute(HANDLED_ATTR, 'viewed');
+      return;
     }
 
-    // Fallback path: either the button isn't rendered (virtualized row) or
-    // the click didn't take effect. POST to the API and fake the visual.
-    const result = await markViewedAPI(path);
-    if (result.ok && toggle && toggle.kind === 'button') {
-      try {
-        toggle.el.setAttribute('aria-pressed', 'true');
-        toggle.el.setAttribute('aria-label', 'Viewed');
-      } catch (_) {}
-    }
-    if (!result.ok) {
-      fileEl.removeAttribute(HANDLED_ATTR);
+    fileEl.setAttribute('data-greadext-busy', '1');
+    try {
+      // Ask the page-world to click the toggle — for the React button this
+      // invokes onClick directly via __reactProps so React's own state +
+      // network request fire (file visibly collapses, no refresh needed).
+      const click = await clickToggleViaBridge(path);
+      if (click.found) {
+        // Wait up to 2s for the UI to reflect the change.
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+          const t = getViewedToggle(fileEl);
+          if (t && t.isViewed()) {
+            fileEl.setAttribute(HANDLED_ATTR, 'viewed');
+            return;
+          }
+        }
+      }
+
+      // Click didn't take effect (or the entry has no toggle yet). POST
+      // directly so the file is at least saved server-side; also flip
+      // aria attributes so the button visually reflects the change.
+      const result = await markViewedAPI(path);
+      if (result.ok) {
+        if (toggle && toggle.kind === 'button') {
+          try {
+            toggle.el.setAttribute('aria-pressed', 'true');
+            toggle.el.setAttribute('aria-label', 'Viewed');
+          } catch (_) {}
+        }
+        fileEl.setAttribute(HANDLED_ATTR, 'viewed');
+      }
+      // On failure leave HANDLED_ATTR unset so we retry on the next scan.
+    } finally {
+      fileEl.removeAttribute('data-greadext-busy');
     }
   }
 
@@ -312,6 +349,9 @@
     document
       .querySelectorAll(`[${HANDLED_ATTR}]`)
       .forEach((el) => el.removeAttribute(HANDLED_ATTR));
+    document
+      .querySelectorAll('[data-greadext-busy]')
+      .forEach((el) => el.removeAttribute('data-greadext-busy'));
   }
 
   async function run({ force = false } = {}) {
@@ -323,12 +363,14 @@
     startObserver();
     // React may mount the diff list after document_idle. Retry a few times
     // so we don't depend solely on the mutation observer catching it.
-    setTimeout(() => scan(), 500);
-    setTimeout(() => scan(), 1500);
-    setTimeout(() => scan(), 3000);
+    // React may mount the diff list well after document_idle on slow loads.
+    // Keep retrying for ~15s so we catch late-mounted entries.
+    [500, 1500, 3000, 5000, 8000, 12000, 16000].forEach((t) =>
+      setTimeout(() => scan(), t)
+    );
     setTimeout(() => {
       if (document.querySelectorAll(FILE_SELECTORS).length === 0) diagnose();
-    }, 4500);
+    }, 6000);
   }
 
   // ---- diagnostics (only when no file containers are found) ----

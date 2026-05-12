@@ -34,43 +34,127 @@
     return origFetch.apply(this, arguments);
   };
 
+  // Strip Unicode bidi marks GitHub adds around link text.
+  const stripBidi = (s) => (s || '').replace(/[‎‏‪‫‬‭‮]/g, '').trim();
+
+  function findEntryByPath(path) {
+    const entries = document.querySelectorAll(
+      '[class*="PullRequestDiffsList-module__diffEntry"], div.file[data-tagsearch-path], .file[data-tagsearch-path]'
+    );
+    for (const entry of entries) {
+      const tag = entry.getAttribute && entry.getAttribute('data-tagsearch-path');
+      if (tag === path) return entry;
+      const link = entry.querySelector && entry.querySelector('a[href^="#diff-"]');
+      if (link && stripBidi(link.textContent) === path) return entry;
+    }
+    return null;
+  }
+
+  function callReactOnClick(btn) {
+    if (!btn) return false;
+    const key = Object.keys(btn).find((k) => k.startsWith('__reactProps'));
+    if (!key) return false;
+    const props = btn[key];
+    if (!props || typeof props.onClick !== 'function') return false;
+    try {
+      const fakeEvent = {
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        isDefaultPrevented: () => false,
+        isPropagationStopped: () => false,
+        type: 'click',
+        target: btn,
+        currentTarget: btn,
+        nativeEvent: new MouseEvent('click', { bubbles: true, cancelable: true }),
+      };
+      props.onClick(fakeEvent);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function clickToggleForPath(path) {
+    const entry = findEntryByPath(path);
+    if (!entry) return { found: false, reason: 'no-entry' };
+    // Legacy checkbox path
+    const cb = entry.querySelector('input.js-reviewed-checkbox, input[name="viewed"]');
+    if (cb) {
+      if (cb.checked) return { found: true, alreadyViewed: true };
+      try { cb.click(); } catch (_) {}
+      return { found: true, kind: 'checkbox' };
+    }
+    // New React button
+    const btn = entry.querySelector('button[class*="MarkAsViewedButton-module"]');
+    if (!btn) return { found: false, reason: 'no-toggle' };
+    const pressed = btn.getAttribute('aria-pressed');
+    if (pressed === 'true') return { found: true, alreadyViewed: true };
+    const viaReact = callReactOnClick(btn);
+    if (viaReact) return { found: true, kind: 'button-react' };
+    try {
+      btn.focus();
+      btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, button: 0 }));
+      btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, button: 0 }));
+      btn.click();
+    } catch (_) {}
+    return { found: true, kind: 'button-dom' };
+  }
+
   window.addEventListener('message', async (e) => {
     if (e.source !== window) return;
     const d = e.data;
     if (!d || d.__greadext !== true) return;
-    if (d.type !== 'mark-viewed') return;
-    const { id, url, headers, body } = d;
-    try {
-      const resp = await origFetch(url, {
-        method: 'POST',
-        credentials: 'include',
-        headers,
-        body,
-      });
-      let bodyText = null;
-      if (!resp.ok) bodyText = await resp.text().catch(() => '');
+
+    if (d.type === 'click-toggle') {
+      const { id, path } = d;
+      let result;
+      try {
+        result = clickToggleForPath(path);
+      } catch (err) {
+        result = { found: false, error: err && err.message };
+      }
       window.postMessage(
-        {
-          __greadext: true,
-          type: 'mark-viewed-result',
-          id,
-          ok: resp.ok,
-          status: resp.status,
-          body: bodyText,
-        },
+        { __greadext: true, type: 'click-toggle-result', id, ...result },
         '*'
       );
-    } catch (err) {
-      window.postMessage(
-        {
-          __greadext: true,
-          type: 'mark-viewed-result',
-          id,
-          ok: false,
-          error: err && err.message,
-        },
-        '*'
-      );
+      return;
+    }
+
+    if (d.type === 'mark-viewed') {
+      const { id, url, headers, body } = d;
+      try {
+        const resp = await origFetch(url, {
+          method: 'POST',
+          credentials: 'include',
+          headers,
+          body,
+        });
+        let bodyText = null;
+        if (!resp.ok) bodyText = await resp.text().catch(() => '');
+        window.postMessage(
+          {
+            __greadext: true,
+            type: 'mark-viewed-result',
+            id,
+            ok: resp.ok,
+            status: resp.status,
+            body: bodyText,
+          },
+          '*'
+        );
+      } catch (err) {
+        window.postMessage(
+          {
+            __greadext: true,
+            type: 'mark-viewed-result',
+            id,
+            ok: false,
+            error: err && err.message,
+          },
+          '*'
+        );
+      }
+      return;
     }
   });
 })();
