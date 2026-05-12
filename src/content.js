@@ -3,6 +3,7 @@
 // "Viewed" control so GitHub collapses them. Supports both the legacy
 // /files DOM and the new React-based /changes experience.
 (function () {
+  console.log('[GReadExt] v0.1.2 loaded on', location.href);
   const HANDLED_ATTR = 'data-greadext-handled';
   const CLICK_INTERVAL_MS = 80;
   const LRM_RE = /[‎‏‪-‮]/g;
@@ -278,9 +279,14 @@
     }
   }
 
+  let lastReportedCount = -1;
   function scan({ force = false } = {}) {
     if (!isPullFilesPage()) return;
     const files = document.querySelectorAll(FILE_SELECTORS);
+    if (files.length !== lastReportedCount) {
+      console.log('[GReadExt] scan: found', files.length, 'file containers');
+      lastReportedCount = files.length;
+    }
     files.forEach((el) => processFile(el, { force }));
   }
 
