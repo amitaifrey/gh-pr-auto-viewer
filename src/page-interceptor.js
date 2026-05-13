@@ -26,6 +26,17 @@
       const link = entry.querySelector && entry.querySelector('a[href^="#diff-"]');
       if (link && stripBidi(link.textContent) === path) return entry;
     }
+    // Large-PR optimized mode: walk up from each viewed button to find an
+    // ancestor whose file-path link matches.
+    const buttons = document.querySelectorAll('button[class*="MarkAsViewedButton-module"]');
+    for (const btn of buttons) {
+      let el = btn.parentElement;
+      for (let i = 0; i < 15 && el; i++) {
+        const link = el.querySelector('a[href^="#diff-"]');
+        if (link && stripBidi(link.textContent) === path) return el;
+        el = el.parentElement;
+      }
+    }
     return null;
   }
 

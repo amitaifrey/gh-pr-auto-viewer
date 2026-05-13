@@ -15,6 +15,7 @@
     // New /changes — CSS-modules class with hash; match the prefix.
     '[class*="PullRequestDiffsList-module__diffEntry"]',
   ].join(',');
+  const VIEWED_BUTTON_SELECTOR = 'button[class*="MarkAsViewedButton-module"]';
 
   let settings = { patterns: [], enabled: true };
   let observer = null;
@@ -47,6 +48,20 @@
       fileEl.querySelector?.('clipboard-copy[value]')?.getAttribute('value') ||
       null
     );
+  }
+
+  // In GitHub's "optimized for large PRs" mode the usual diff-list container
+  // and its CSS-module class are gone, but the MarkAsViewed buttons remain.
+  // Walk up from a button to find the nearest ancestor that also contains
+  // the file-path anchor (`a[href^="#diff-"]`) — that ancestor effectively
+  // is the per-file container.
+  function findFileEntryFromButton(btn) {
+    let el = btn.parentElement;
+    for (let i = 0; i < 15 && el; i++) {
+      if (el.querySelector('a[href^="#diff-"]')) return el;
+      el = el.parentElement;
+    }
+    return null;
   }
 
   function getViewedToggle(fileEl) {
@@ -319,7 +334,19 @@
   let lastReportedCount = -1;
   function scan({ force = false } = {}) {
     if (!isPullFilesPage()) return;
-    const files = document.querySelectorAll(FILE_SELECTORS);
+    let files = Array.from(document.querySelectorAll(FILE_SELECTORS));
+    if (files.length === 0) {
+      // Large-PR optimized mode: derive entries by walking up from each
+      // MarkAsViewedButton to its nearest file-path-owning ancestor.
+      const seen = new Set();
+      document.querySelectorAll(VIEWED_BUTTON_SELECTOR).forEach((btn) => {
+        const entry = findFileEntryFromButton(btn);
+        if (entry && !seen.has(entry)) {
+          seen.add(entry);
+          files.push(entry);
+        }
+      });
+    }
     if (files.length !== lastReportedCount) {
       console.log('[GReadExt] scan: found', files.length, 'file containers');
       lastReportedCount = files.length;
@@ -369,7 +396,12 @@
       setTimeout(() => scan(), t)
     );
     setTimeout(() => {
-      if (document.querySelectorAll(FILE_SELECTORS).length === 0) diagnose();
+      if (
+        document.querySelectorAll(FILE_SELECTORS).length === 0 &&
+        document.querySelectorAll(VIEWED_BUTTON_SELECTOR).length === 0
+      ) {
+        diagnose();
+      }
     }, 6000);
   }
 
