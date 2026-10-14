@@ -3,7 +3,7 @@
 // "Viewed" control so GitHub collapses them. Supports both the legacy
 // /files DOM and the new React-based /changes experience.
 (function () {
-  console.log('[GReadExt] v0.1.2 loaded on', location.href);
+  console.log('[GReadExt] v0.1.3 loaded on', location.href);
   const HANDLED_ATTR = 'data-greadext-handled';
   const CLICK_INTERVAL_MS = 80;
   const LRM_RE = /[‎‏‪-‮]/g;
@@ -12,10 +12,35 @@
     // Legacy /files
     'div.file[data-tagsearch-path]',
     '.file[data-tagsearch-path]',
-    // New /changes — CSS-modules class with hash; match the prefix.
+    // New /changes — virtualized row keyed by sha256(path). Stable data
+    // attribute; GitHub's CSS-module class names are minified hashes now.
+    '[data-path-digest]',
+    // Older /changes builds that still emitted module-prefixed classes.
     '[class*="PullRequestDiffsList-module__diffEntry"]',
   ].join(',');
-  const VIEWED_BUTTON_SELECTOR = 'button[class*="MarkAsViewedButton-module"]';
+  // Class names no longer carry the component name, so match the toggle by
+  // its accessible label ("Viewed" / "Not Viewed") and keep the old class
+  // selector as a fallback.
+  const VIEWED_LABEL_RE = /^(not )?viewed$/i;
+  const LEGACY_VIEWED_BUTTON_SELECTOR = 'button[class*="MarkAsViewedButton-module"]';
+
+  function isViewedButton(btn) {
+    if (btn.matches(LEGACY_VIEWED_BUTTON_SELECTOR)) return true;
+    return VIEWED_LABEL_RE.test((btn.getAttribute('aria-label') || '').trim());
+  }
+
+  function findViewedButton(root) {
+    const legacy = root.querySelector(LEGACY_VIEWED_BUTTON_SELECTOR);
+    if (legacy) return legacy;
+    for (const btn of root.querySelectorAll('button[aria-label]')) {
+      if (isViewedButton(btn)) return btn;
+    }
+    return null;
+  }
+
+  function findAllViewedButtons() {
+    return Array.from(document.querySelectorAll('button[aria-label]')).filter(isViewedButton);
+  }
 
   let settings = { patterns: [], enabled: true };
   let observer = null;
@@ -32,32 +57,155 @@
     );
   }
 
-  function getFilePath(fileEl) {
-    // Legacy
-    const tag = fileEl.getAttribute?.('data-tagsearch-path');
-    if (tag) return tag;
-    // New: file path is the text of the first anchor pointing at the diff anchor.
-    const link = fileEl.querySelector('a[href^="#diff-"]');
-    if (link) {
-      const txt = (link.textContent || '').replace(LRM_RE, '').trim();
-      if (txt) return txt;
-    }
-    // Other fallbacks
-    return (
-      fileEl.querySelector?.('[data-path]')?.getAttribute('data-path') ||
-      fileEl.querySelector?.('clipboard-copy[value]')?.getAttribute('value') ||
-      null
-    );
+  // ---- path resolution ----
+  // GitHub's diff anchors are `diff-<sha256(path)>`. The new UI often shows
+  // only the basename, so we recover the full path by hashing candidate
+  // strings (header text, embedded JSON) and keeping the one that matches.
+  const DIGEST_RE = /^[0-9a-f]{64}$/;
+  const hashCache = new Map(); // text -> hex digest
+  const digestToPath = new Map(); // hex digest -> verified path
+  let embeddedScannedFor = null;
+
+  async function sha256Hex(text) {
+    if (hashCache.has(text)) return hashCache.get(text);
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    const hex = Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+    hashCache.set(text, hex);
+    return hex;
   }
 
-  // In GitHub's "optimized for large PRs" mode the usual diff-list container
-  // and its CSS-module class are gone, but the MarkAsViewed buttons remain.
-  // Walk up from a button to find the nearest ancestor that also contains
-  // the file-path anchor (`a[href^="#diff-"]`) — that ancestor effectively
-  // is the per-file container.
+  function getDigest(fileEl) {
+    const attr = fileEl.getAttribute?.('data-path-digest');
+    if (attr && DIGEST_RE.test(attr)) return attr;
+    const ids = [fileEl.id, fileEl.querySelector?.('[id^="diff-"]')?.id];
+    for (const id of ids) {
+      const m = id && id.match(/^diff-([0-9a-f]{64})$/);
+      if (m) return m[1];
+    }
+    const href = fileEl.querySelector?.('a[href^="#diff-"]')?.getAttribute('href');
+    const m = href && href.match(/^#diff-([0-9a-f]{64})/);
+    return m ? m[1] : null;
+  }
+
+  function headerCandidates(fileEl) {
+    const header = fileEl.querySelector('[data-diff-header-wrapper]') || fileEl;
+    const out = new Set();
+    const add = (s) => {
+      const t = (s || '').replace(LRM_RE, '').trim();
+      if (t && t.length <= 1000 && !t.includes('\n')) out.add(t);
+    };
+    const els = header.querySelectorAll('*');
+    for (let i = 0; i < els.length && i < 400; i++) {
+      const el = els[i];
+      add(el.textContent);
+      add(el.getAttribute('title'));
+      add(el.getAttribute('value'));
+      add(el.getAttribute('data-path'));
+      add(el.getAttribute('data-file-path'));
+    }
+    return out;
+  }
+
+  // React pages ship their initial payload as JSON in <script> tags. Hash
+  // every string under a key that looks like a path, once per page.
+  async function scanEmbeddedPaths() {
+    // Keyed on pathname: tree clicks change the #diff- hash, and re-parsing
+    // the (large) payload for each would be wasteful.
+    if (embeddedScannedFor === location.pathname) return;
+    embeddedScannedFor = location.pathname;
+    const strings = new Set();
+    const walk = (node, key, depth) => {
+      if (depth > 40 || node == null) return;
+      if (typeof node === 'string') {
+        if (/path|name/i.test(key || '') && node.length <= 1000 && !node.includes('\n')) {
+          strings.add(node);
+        }
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const v of node) walk(v, key, depth + 1);
+        return;
+      }
+      if (typeof node === 'object') {
+        for (const k in node) walk(node[k], k, depth + 1);
+      }
+    };
+    for (const s of document.querySelectorAll('script[type="application/json"]')) {
+      try {
+        walk(JSON.parse(s.textContent || 'null'), '', 0);
+      } catch (_) {}
+    }
+    for (const s of strings) {
+      digestToPath.set(await sha256Hex(s), s);
+    }
+  }
+
+  // The file tree (#pr-file-tree) renders every file in the PR, even ones
+  // whose diff row is virtualized away, and each tree item's id is the
+  // file's full path.
+  function treeAnchors() {
+    return document.querySelectorAll('#pr-file-tree a[href^="#diff-"]');
+  }
+
+  function treeAnchorDigest(a) {
+    const m = (a.getAttribute('href') || '').match(/^#diff-([0-9a-f]{64})/);
+    return m ? m[1] : null;
+  }
+
+  // Resolve a digest to its verified path without needing the diff row.
+  async function resolveDigest(digest) {
+    if (digestToPath.has(digest)) return digestToPath.get(digest);
+    const a = document.querySelector(`#pr-file-tree a[href="#diff-${digest}"]`);
+    const id = a?.closest('li[role="treeitem"]')?.id;
+    if (id && (await sha256Hex(id)) === digest) {
+      digestToPath.set(digest, id);
+      return id;
+    }
+    await scanEmbeddedPaths();
+    return digestToPath.get(digest) || null;
+  }
+
+  // Returns { path, verified }. `verified` means sha256(path) matched the
+  // entry's digest (or it came from the legacy data attribute), so it's
+  // safe to send to the /file_review API.
+  async function getFilePath(fileEl) {
+    // Legacy
+    const tag = fileEl.getAttribute?.('data-tagsearch-path');
+    if (tag) return { path: tag, verified: true };
+
+    const digest = getDigest(fileEl);
+    if (digest) {
+      const resolved = await resolveDigest(digest);
+      if (resolved) return { path: resolved, verified: true };
+      for (const c of headerCandidates(fileEl)) {
+        const h = await sha256Hex(c);
+        if (h === digest) {
+          digestToPath.set(digest, c);
+          return { path: c, verified: true };
+        }
+      }
+    }
+
+    // Unverified fallbacks: text of the diff anchor (may be just the
+    // basename in the new UI), then other attributes.
+    const link = fileEl.querySelector('a[href^="#diff-"]');
+    const txt = link && (link.textContent || '').replace(LRM_RE, '').trim();
+    const path =
+      txt ||
+      fileEl.querySelector?.('[data-path]')?.getAttribute('data-path') ||
+      fileEl.querySelector?.('clipboard-copy[value]')?.getAttribute('value') ||
+      null;
+    return { path, verified: false };
+  }
+
+  // In GitHub's "optimized for large PRs" mode the usual per-file container
+  // may be missing, but the Viewed buttons remain. Walk up from a button to
+  // the nearest ancestor that also carries a diff anchor or digest — that
+  // ancestor effectively is the per-file container.
   function findFileEntryFromButton(btn) {
     let el = btn.parentElement;
     for (let i = 0; i < 15 && el; i++) {
+      if (el.hasAttribute('data-path-digest') || /^diff-[0-9a-f]{64}$/.test(el.id)) return el;
       if (el.querySelector('a[href^="#diff-"]')) return el;
       el = el.parentElement;
     }
@@ -76,8 +224,8 @@
         isViewed: () => !!cb.checked,
       };
     }
-    // New: React button. Class hash rotates, so match the module prefix.
-    const btn = fileEl.querySelector?.('button[class*="MarkAsViewedButton-module"]');
+    // New: React button, matched by aria-label (class names are minified).
+    const btn = findViewedButton(fileEl);
     if (btn) {
       return {
         kind: 'button',
@@ -124,11 +272,26 @@
   }
 
   function getClientVersion() {
-    return (
+    const meta =
       document.querySelector('meta[name="github-client-version"]')?.getAttribute('content') ||
-      document.querySelector('meta[name="client-version"]')?.getAttribute('content') ||
-      null
-    );
+      document.querySelector('meta[name="client-version"]')?.getAttribute('content');
+    if (meta) return meta;
+    // Newer pages carry it in the client-env JSON blob instead of a meta tag.
+    const env = document.querySelector('script[type="application/json"][data-target="client-env"]');
+    if (!env) return null;
+    let found = null;
+    const walk = (node, key, depth) => {
+      if (found || depth > 10 || node == null) return;
+      if (typeof node === 'string') {
+        if (/version|sha/i.test(key || '') && /^[0-9a-f]{40}$/.test(node)) found = node;
+        return;
+      }
+      if (typeof node === 'object') for (const k in node) walk(node[k], k, depth + 1);
+    };
+    try {
+      walk(JSON.parse(env.textContent || 'null'), '', 0);
+    } catch (_) {}
+    return found;
   }
 
   // Captured headers from a real /file_review request observed on the page,
@@ -217,10 +380,10 @@
     }
   });
 
-  async function clickToggleViaBridge(path) {
+  async function clickToggleViaBridge(path, digest) {
     const id = nextRequestId++;
     const promise = new Promise((resolve) => pendingRequests.set(id, resolve));
-    window.postMessage({ __greadext: true, type: 'click-toggle', id, path }, '*');
+    window.postMessage({ __greadext: true, type: 'click-toggle', id, path, digest }, '*');
     const timeout = new Promise((resolve) =>
       setTimeout(() => resolve({ found: false, reason: 'timeout' }), 3000)
     );
@@ -275,38 +438,77 @@
     try { btn.click(); } catch (_) {}
   }
 
+  // HANDLED_ATTR is "<state>:<key>" so a virtualized row that React reuses
+  // for a different file isn't skipped because of a stale mark.
+  function entryKey(fileEl) {
+    return getDigest(fileEl) || fileEl.getAttribute('data-tagsearch-path') || '';
+  }
+
+  // Per-PR outcome for each file digest, kept in memory so a row that the
+  // virtualized list unmounts and remounts isn't re-marked (e.g. after the
+  // user un-viewed it by hand). States: not-matched | viewed | pending
+  // (API POST queued) | api-viewed (POSTed; row's UI may still be stale)
+  // | api-failed.
+  const digestState = new Map();
+  const stateKey = (digest) => `${getPrBase()}|${digest}`;
+
+  function markHandled(fileEl, key, state) {
+    fileEl.setAttribute(HANDLED_ATTR, `${state}:${key}`);
+    if (DIGEST_RE.test(key)) digestState.set(stateKey(key), state);
+  }
+
+  let warnedUnverified = false;
+
   async function processFile(fileEl, { force = false } = {}) {
+    const key = entryKey(fileEl);
     const state = fileEl.getAttribute(HANDLED_ATTR);
-    if (!force && (state === 'viewed' || state === 'not-matched')) return;
+    if (!force && (state === `viewed:${key}` || state === `not-matched:${key}`)) return;
     if (fileEl.getAttribute('data-greadext-busy') === '1') return;
-
-    const path = getFilePath(fileEl);
-    if (!path) return; // try again later (children may not be mounted yet)
-
-    if (!window.GReadGlob.matchAny(path, settings.patterns)) {
-      fileEl.setAttribute(HANDLED_ATTR, 'not-matched');
-      return;
-    }
-
-    const toggle = getViewedToggle(fileEl);
-    if (toggle && toggle.isViewed()) {
-      fileEl.setAttribute(HANDLED_ATTR, 'viewed');
-      return;
+    if (DIGEST_RE.test(key)) {
+      const ds = digestState.get(stateKey(key));
+      if (ds === 'pending') return; // off-screen POST in flight; rescanned after
+      if (!force && (ds === 'viewed' || ds === 'not-matched')) {
+        fileEl.setAttribute(HANDLED_ATTR, `${ds}:${key}`);
+        return;
+      }
+      // api-viewed / api-failed fall through: sync the UI by clicking.
     }
 
     fileEl.setAttribute('data-greadext-busy', '1');
     try {
+      const { path, verified } = await getFilePath(fileEl);
+      if (!path) return; // try again later (children may not be mounted yet)
+      if (!verified && !warnedUnverified) {
+        warnedUnverified = true;
+        console.log('[GReadExt] could not verify full path for', key, '— matching on', path);
+      }
+
+      if (!window.GReadGlob.matchAny(path, settings.patterns)) {
+        markHandled(fileEl, key, 'not-matched');
+        return;
+      }
+
+      const toggle = getViewedToggle(fileEl);
+      if (toggle && toggle.isViewed()) {
+        markHandled(fileEl, key, 'viewed');
+        return;
+      }
+
       // Ask the page-world to click the toggle — for the React button this
       // invokes onClick directly via __reactProps so React's own state +
       // network request fire (file visibly collapses, no refresh needed).
-      const click = await clickToggleViaBridge(path);
+      const click = await clickToggleViaBridge(path, getDigest(fileEl));
       if (click.found) {
+        if (click.alreadyViewed) {
+          markHandled(fileEl, key, 'viewed');
+          return;
+        }
         // Wait up to 2s for the UI to reflect the change.
         for (let i = 0; i < 20; i++) {
           await new Promise((r) => setTimeout(r, 100));
           const t = getViewedToggle(fileEl);
           if (t && t.isViewed()) {
-            fileEl.setAttribute(HANDLED_ATTR, 'viewed');
+            markHandled(fileEl, key, 'viewed');
             return;
           }
         }
@@ -314,7 +516,9 @@
 
       // Click didn't take effect (or the entry has no toggle yet). POST
       // directly so the file is at least saved server-side; also flip
-      // aria attributes so the button visually reflects the change.
+      // aria attributes so the button visually reflects the change. Only
+      // with a verified path — a bare basename would mark the wrong file.
+      if (!verified) return;
       const result = await markViewedAPI(path);
       if (result.ok) {
         if (toggle && toggle.kind === 'button') {
@@ -323,7 +527,7 @@
             toggle.el.setAttribute('aria-label', 'Viewed');
           } catch (_) {}
         }
-        fileEl.setAttribute(HANDLED_ATTR, 'viewed');
+        markHandled(fileEl, key, 'viewed');
       }
       // On failure leave HANDLED_ATTR unset so we retry on the next scan.
     } finally {
@@ -335,11 +539,14 @@
   function scan({ force = false } = {}) {
     if (!isPullFilesPage()) return;
     let files = Array.from(document.querySelectorAll(FILE_SELECTORS));
+    // `[data-path-digest]` rows and the old diffEntry class can both match
+    // on some builds; keep only outermost containers.
+    files = files.filter((el) => !el.parentElement?.closest(FILE_SELECTORS));
     if (files.length === 0) {
       // Large-PR optimized mode: derive entries by walking up from each
-      // MarkAsViewedButton to its nearest file-path-owning ancestor.
+      // Viewed button to its nearest file-path-owning ancestor.
       const seen = new Set();
-      document.querySelectorAll(VIEWED_BUTTON_SELECTOR).forEach((btn) => {
+      findAllViewedButtons().forEach((btn) => {
         const entry = findFileEntryFromButton(btn);
         if (entry && !seen.has(entry)) {
           seen.add(entry);
@@ -352,6 +559,71 @@
       lastReportedCount = files.length;
     }
     files.forEach((el) => processFile(el, { force }));
+    scanOffscreen();
+  }
+
+  // ---- off-screen files (virtualized /changes list) ----
+  // The new UI keeps only the diff rows near the viewport in the DOM, so
+  // most files have no toggle to click. Enumerate every file from the file
+  // tree and mark matching, unmounted ones via the same /file_review POST
+  // GitHub's own button sends. When such a row later mounts, processFile
+  // clicks it once so React's state catches up.
+  const API_INTERVAL_MS = 100;
+  let offscreenRunning = false;
+  let offscreenAgain = false;
+
+  function isRowMounted(digest) {
+    return !!(
+      document.querySelector(`[data-path-digest="${digest}"]`) ||
+      document.getElementById(`diff-${digest}`)
+    );
+  }
+
+  async function scanOffscreen() {
+    // Only the virtualized React UI needs this; legacy /files mounts every
+    // file container.
+    if (!document.querySelector('[data-path-digest]')) return;
+    if (offscreenRunning) {
+      offscreenAgain = true;
+      return;
+    }
+    offscreenRunning = true;
+    let marked = 0;
+    let failed = 0;
+    try {
+      do {
+        offscreenAgain = false;
+        const digests = new Set();
+        treeAnchors().forEach((a) => {
+          const d = treeAnchorDigest(a);
+          if (d) digests.add(d);
+        });
+        for (const d of digests) {
+          if (!isPullFilesPage()) return;
+          if (digestState.has(stateKey(d)) || isRowMounted(d)) continue;
+          const path = await resolveDigest(d);
+          if (!path) continue;
+          if (!window.GReadGlob.matchAny(path, settings.patterns)) {
+            digestState.set(stateKey(d), 'not-matched');
+            continue;
+          }
+          digestState.set(stateKey(d), 'pending');
+          const result = await markViewedAPI(path);
+          digestState.set(stateKey(d), result.ok ? 'api-viewed' : 'api-failed');
+          if (result.ok) marked++;
+          else failed++;
+          // The row may have mounted while the POST was in flight.
+          if (isRowMounted(d)) scheduleRescan();
+          await new Promise((r) => setTimeout(r, API_INTERVAL_MS));
+        }
+      } while (offscreenAgain);
+    } finally {
+      offscreenRunning = false;
+      if (marked || failed) {
+        console.log(`[GReadExt] off-screen: marked ${marked} file(s) viewed via API` +
+          (failed ? `, ${failed} failed` : ''));
+      }
+    }
   }
 
   // Debounced full rescan — cheaper to scan all FILE_SELECTORS than to track
@@ -379,6 +651,10 @@
     document
       .querySelectorAll('[data-greadext-busy]')
       .forEach((el) => el.removeAttribute('data-greadext-busy'));
+    const prefix = `${getPrBase()}|`;
+    for (const [k, v] of digestState) {
+      if (k.startsWith(prefix) && v !== 'pending') digestState.delete(k);
+    }
   }
 
   async function run({ force = false } = {}) {
@@ -398,7 +674,7 @@
     setTimeout(() => {
       if (
         document.querySelectorAll(FILE_SELECTORS).length === 0 &&
-        document.querySelectorAll(VIEWED_BUTTON_SELECTOR).length === 0
+        findAllViewedButtons().length === 0
       ) {
         diagnose();
       }
@@ -414,13 +690,14 @@
       const summary = {
         url: location.href,
         legacyFiles: document.querySelectorAll('[data-tagsearch-path]').length,
-        newDiffEntries: document.querySelectorAll(
+        pathDigestRows: document.querySelectorAll('[data-path-digest]').length,
+        oldDiffEntries: document.querySelectorAll(
           '[class*="PullRequestDiffsList-module__diffEntry"]'
         ).length,
+        virtualizedList: !!document.querySelector('[data-testid="virtualized-diffs-list"]'),
         progressiveList: !!document.querySelector('[data-testid="progressive-diffs-list"]'),
-        viewedButtons: document.querySelectorAll(
-          'button[class*="MarkAsViewedButton-module"]'
-        ).length,
+        viewedButtons: findAllViewedButtons().length,
+        diffAnchors: document.querySelectorAll('a[href^="#diff-"]').length,
       };
       console.log(
         '%c[GReadExt] no files matched — diagnostics:',

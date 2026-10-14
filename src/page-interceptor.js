@@ -16,9 +16,31 @@
 
   const stripBidi = (s) => (s || '').replace(/[‎‏‪‫‬‭‮]/g, '').trim();
 
+  // GitHub's minified class names no longer carry the component name, so
+  // match the toggle by aria-label and keep the old class as a fallback.
+  const VIEWED_LABEL_RE = /^(not )?viewed$/i;
+  const LEGACY_VIEWED_BUTTON_SELECTOR = 'button[class*="MarkAsViewedButton-module"]';
+
+  function findViewedButton(root) {
+    const legacy = root.querySelector(LEGACY_VIEWED_BUTTON_SELECTOR);
+    if (legacy) return legacy;
+    for (const btn of root.querySelectorAll('button[aria-label]')) {
+      if (VIEWED_LABEL_RE.test((btn.getAttribute('aria-label') || '').trim())) return btn;
+    }
+    return null;
+  }
+
+  function findEntryByDigest(digest) {
+    if (!digest || !/^[0-9a-f]{64}$/.test(digest)) return null;
+    return (
+      document.querySelector(`[data-path-digest="${digest}"]`) ||
+      document.getElementById(`diff-${digest}`)
+    );
+  }
+
   function findEntryByPath(path) {
     const entries = document.querySelectorAll(
-      '[class*="PullRequestDiffsList-module__diffEntry"], div.file[data-tagsearch-path], .file[data-tagsearch-path]'
+      '[data-path-digest], [class*="PullRequestDiffsList-module__diffEntry"], div.file[data-tagsearch-path], .file[data-tagsearch-path]'
     );
     for (const entry of entries) {
       const tag = entry.getAttribute && entry.getAttribute('data-tagsearch-path');
@@ -28,7 +50,10 @@
     }
     // Large-PR optimized mode: walk up from each viewed button to find an
     // ancestor whose file-path link matches.
-    const buttons = document.querySelectorAll('button[class*="MarkAsViewedButton-module"]');
+    const buttons = Array.from(document.querySelectorAll('button[aria-label]')).filter(
+      (b) => b.matches(LEGACY_VIEWED_BUTTON_SELECTOR) ||
+        VIEWED_LABEL_RE.test((b.getAttribute('aria-label') || '').trim())
+    );
     for (const btn of buttons) {
       let el = btn.parentElement;
       for (let i = 0; i < 15 && el; i++) {
@@ -64,8 +89,8 @@
     }
   }
 
-  function clickToggleForPath(path) {
-    const entry = findEntryByPath(path);
+  function clickToggleForPath(path, digest) {
+    const entry = findEntryByDigest(digest) || findEntryByPath(path);
     if (!entry) return { found: false, reason: 'no-entry' };
     const cb = entry.querySelector('input.js-reviewed-checkbox, input[name="viewed"]');
     if (cb) {
@@ -73,7 +98,7 @@
       try { cb.click(); } catch (_) {}
       return { found: true, kind: 'checkbox' };
     }
-    const btn = entry.querySelector('button[class*="MarkAsViewedButton-module"]');
+    const btn = findViewedButton(entry);
     if (!btn) return { found: false, reason: 'no-toggle' };
     if (btn.getAttribute('aria-pressed') === 'true') return { found: true, alreadyViewed: true };
     const viaReact = callReactOnClick(btn);
@@ -93,10 +118,10 @@
     if (!d || d.__greadext !== true) return;
 
     if (d.type === 'click-toggle') {
-      const { id, path } = d;
+      const { id, path, digest } = d;
       let result;
       try {
-        result = clickToggleForPath(path);
+        result = clickToggleForPath(path, digest);
       } catch (err) {
         result = { found: false, error: err && err.message };
       }
